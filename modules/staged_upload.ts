@@ -178,6 +178,52 @@ export async function verErroresBulk(bulkOperationId: string) {
 
 
 
+export async function subirImagenShopify(imageUrl: string): Promise<string> {
+  const response = await fetch(imageUrl);
+  if (!response.ok) throw new Error(`No se pudo descargar la imagen: ${response.status}`);
+
+  const buffer = await response.arrayBuffer();
+  const mimeType = response.headers.get('content-type') ?? 'image/jpeg';
+  const filename = imageUrl.split('/').pop()?.split('?')[0] ?? 'image.jpg';
+  const fileSize = buffer.byteLength;
+
+  const queryStaged = `
+      mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+        stagedUploadsCreate(input: $input) {
+          stagedTargets {
+            url
+            resourceUrl
+            parameters { name value }
+          }
+        }
+      }
+  `;
+
+  const stagedData = await graphql(queryStaged, {
+    input: [{
+      filename,
+      mimeType,
+      resource: "FILE",
+      fileSize: fileSize.toString()
+    }]
+  });
+
+  const target = stagedData.stagedUploadsCreate.stagedTargets[0];
+
+  const uploadResponse = await fetch(target.url, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': mimeType,
+      'Content-Length': fileSize.toString()
+    },
+    body: buffer
+  });
+
+  if (!uploadResponse.ok) throw new Error(`Error al subir imagen a Shopify: ${await uploadResponse.text()}`);
+
+  return target.resourceUrl;
+}
+
 // Shopify es especialito y requiere una subida aparte para publicar los productos en los canales de venta
 export async function subirArchivoPublicacionShopify(path: string) {
   const stat = Bun.file(path);

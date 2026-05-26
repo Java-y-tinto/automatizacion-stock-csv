@@ -5,6 +5,7 @@ import { graphql } from "../functions";
 type ShopifyId = {
     productId: string;
     variantId: string;
+    hasImages: boolean;
 };
 
 type ProductMaps = {
@@ -64,6 +65,7 @@ async function obtenerMapaProductos(): Promise<ProductMaps> {
                             node {
                                 id
                                 handle
+                                featuredMedia { id }
                                 variants {
                                     edges {
                                         node {
@@ -121,13 +123,13 @@ async function obtenerMapaProductos(): Promise<ProductMaps> {
 
     // Parse JSONL — each line is either a product or a variant (__parentId)
     const text = await fetch(urlDescarga).then((r) => r.text());
-    const productosTemp = new Map<string, { handle: string; variantId: string | null; sku: string | null }>();
+    const productosTemp = new Map<string, { handle: string; variantId: string | null; sku: string | null; hasImages: boolean }>();
 
     for (const linea of text.split("\n").filter(Boolean)) {
         try {
             const data = JSON.parse(linea);
             if (data.handle) {
-                productosTemp.set(data.id, { handle: data.handle, variantId: null, sku: null });
+                productosTemp.set(data.id, { handle: data.handle, variantId: null, sku: null, hasImages: !!data.featuredMedia });
             } else if (data.__parentId) {
                 const prod = productosTemp.get(data.__parentId);
                 if (prod) { prod.variantId = data.id; prod.sku = data.sku; }
@@ -139,7 +141,7 @@ async function obtenerMapaProductos(): Promise<ProductMaps> {
 
     for (const [productId, info] of productosTemp.entries()) {
         if (!info.variantId) continue;
-        const entry: ShopifyId = { productId, variantId: info.variantId };
+        const entry: ShopifyId = { productId, variantId: info.variantId, hasImages: info.hasImages };
         if (info.sku) mapaPorSku.set(info.sku, entry);
         if (info.handle) mapaPorHandle.set(info.handle, entry);
     }
@@ -164,6 +166,9 @@ async function generateBulkFile(
 
     const filas = deduplicateBySku(data).filter((row) => row.title?.trim());
 
+    const MAX_IMAGE_UPLOADS = 500;
+    let imageUploadsThisRun = 0;
+
     const lines = filas.map((item) => {
         const titulo = item.title.trim();
         const handle = toHandle(titulo, item.id);
@@ -176,6 +181,16 @@ async function generateBulkFile(
             console.log(`[OK] Producto "${item.id}" rescatado por handle.`);
         }
 
+        const needsImage = item.image_link?.trim() && (!existente || !existente.hasImages) && imageUploadsThisRun < MAX_IMAGE_UPLOADS;
+        if (needsImage) imageUploadsThisRun++;
+        const filesField = needsImage ? {
+            files: [{
+                originalSource: item.image_link!.trim(),
+                contentType: "IMAGE",
+                alt: titulo,
+            }]
+        } : {};
+
         const payload = {
             input: {
                 ...(existente ? { id: existente.productId } : { handle }),
@@ -183,14 +198,7 @@ async function generateBulkFile(
                 descriptionHtml: item.DESCRIPTION?.trim() || titulo,
                 status: "ACTIVE",
                 productOptions: [{ name: "Title", values: [{ name: "Default Title" }] }],
-
-                ...(item.image_link?.trim() ? {
-                    files: [{
-                        originalSource: item.image_link.trim(),
-                        contentType: "IMAGE",
-                        alt: titulo,
-                    }],
-                } : {}),
+                ...filesField,
                 collections: ["gid://shopify/Collection/699670921603"],
                 variants: [{
                     ...(existente ? { id: existente.variantId } : {}),
