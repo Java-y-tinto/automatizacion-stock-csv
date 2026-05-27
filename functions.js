@@ -33,7 +33,6 @@ export async function getToken() {
 
     const { access_token, expires_in } = await response.json();
     token = access_token;
-    console.log(token);
     tokenExpiresAt = Date.now() + expires_in * 1000;
     return token;
 }

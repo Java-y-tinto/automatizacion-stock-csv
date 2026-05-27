@@ -166,9 +166,6 @@ async function generateBulkFile(
 
     const filas = deduplicateBySku(data).filter((row) => row.title?.trim());
 
-    const MAX_IMAGE_UPLOADS = 500;
-    let imageUploadsThisRun = 0;
-
     const lines = filas.map((item) => {
         const titulo = item.title.trim();
         const handle = toHandle(titulo, item.id);
@@ -181,8 +178,7 @@ async function generateBulkFile(
             console.log(`[OK] Producto "${item.id}" rescatado por handle.`);
         }
 
-        const needsImage = item.image_link?.trim() && (!existente || !existente.hasImages) && imageUploadsThisRun < MAX_IMAGE_UPLOADS;
-        if (needsImage) imageUploadsThisRun++;
+        const needsImage = item.image_link?.trim() && (!existente || !existente.hasImages);
         const filesField = needsImage ? {
             files: [{
                 originalSource: item.image_link!.trim(),

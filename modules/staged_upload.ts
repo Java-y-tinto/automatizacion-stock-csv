@@ -1,46 +1,61 @@
 import { graphql } from "../functions";
 
+type StagedTarget = {
+  url: string;
+  resourceUrl: string;
+  parameters: { name: string; value: string }[];
+};
+
+async function uploadFormData(target: StagedTarget, file: Blob, filename: string) {
+  const form = new FormData();
+  for (const p of target.parameters) {
+    form.append(p.name, p.value);
+  }
+  form.append("file", file, filename);
+
+  const res = await fetch(target.url, { method: "POST", body: form });
+  if (!res.ok) throw new Error(`Error al subir archivo a Shopify: ${await res.text()}`);
+}
+
+// With policy-based POST uploads, resourceUrl is the bucket root.
+// The actual file path is target.url + the "key" parameter.
+function stagedUploadPath(target: StagedTarget): string {
+  const key = target.parameters.find(p => p.name === "key")?.value;
+  return key ? `${target.url}${key}` : target.resourceUrl;
+}
+
+const STAGED_QUERY = `
+  mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+    stagedUploadsCreate(input: $input) {
+      stagedTargets {
+        url
+        resourceUrl
+        parameters { name value }
+      }
+    }
+  }
+`;
+
 export async function subirArchivoShopify(path: string) {
   const stat = Bun.file(path);
   const nombreArchivo = path.split('/').pop();
   if (!nombreArchivo) throw new Error("No se pudo obtener el nombre del archivo");
 
-  // Pedimos permiso a shopify para subir el archivo
-  const queryStaged = `
-        mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-          stagedUploadsCreate(input: $input) {
-            stagedTargets {
-              url
-              resourceUrl
-              parameters { name value }
-            }
-          }
-        }
-  `;
-
-  const stagedData = await graphql(queryStaged, {
+  const stagedData = await graphql(STAGED_QUERY, {
     input: [{
       filename: nombreArchivo,
       mimeType: "text/jsonl",
       resource: "BULK_MUTATION_VARIABLES",
+      httpMethod: "POST",
       fileSize: stat.size.toString()
     }]
   });
 
-  const target = stagedData.stagedUploadsCreate.stagedTargets[0];
-  console.log("target parameters:", target.parameters)
-  // Subida fisica
-  console.log("target.url:", target.url)
-  const uploadResponse = await fetch(target.url, {
-    method: 'PUT',
-    headers: {
-      'Content-type': 'text/jsonl',
-      'Content-Length': stat.size.toString()
-    },
-    body: stat
-  });
+  const target: StagedTarget = stagedData.stagedUploadsCreate.stagedTargets[0];
+  console.log("target parameters:", target.parameters);
+  console.log("target.url:", target.url);
 
-  if (!uploadResponse.ok) throw new Error(`Error al subir el archivo ${await uploadResponse.text()}`);
+  await uploadFormData(target, stat, nombreArchivo);
 
   console.log("Archivo subido correctamente");
 
@@ -59,7 +74,7 @@ export async function subirArchivoShopify(path: string) {
     `;
 
   const bulkResult = await graphql(mutationBulk, {
-    stagedUploadPath: target.resourceUrl
+    stagedUploadPath: stagedUploadPath(target)
   });
 
   if (bulkResult.bulkOperationRunMutation.userErrors.length > 0) {
@@ -178,6 +193,28 @@ export async function verErroresBulk(bulkOperationId: string) {
 
 
 
+async function esperarArchivoListo(fileId: string) {
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+  const query = `
+    query ($id: ID!) {
+      node(id: $id) {
+        ... on MediaImage { fileStatus }
+        ... on GenericFile  { fileStatus }
+      }
+    }
+  `;
+
+  for (let i = 0; i < 20; i++) {
+    const data = await graphql(query, { id: fileId });
+    const status: string = data.node?.fileStatus;
+    if (status === "READY") return;
+    if (status === "FAILED") throw new Error(`El archivo ${fileId} falló durante el procesamiento en Shopify`);
+    await sleep(2000);
+  }
+
+  throw new Error(`Timeout esperando que el archivo ${fileId} esté listo`);
+}
+
 export async function subirImagenShopify(imageUrl: string): Promise<string> {
   const response = await fetch(imageUrl);
   if (!response.ok) throw new Error(`No se pudo descargar la imagen: ${response.status}`);
@@ -185,43 +222,42 @@ export async function subirImagenShopify(imageUrl: string): Promise<string> {
   const buffer = await response.arrayBuffer();
   const mimeType = response.headers.get('content-type') ?? 'image/jpeg';
   const filename = imageUrl.split('/').pop()?.split('?')[0] ?? 'image.jpg';
-  const fileSize = buffer.byteLength;
 
-  const queryStaged = `
-      mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-        stagedUploadsCreate(input: $input) {
-          stagedTargets {
-            url
-            resourceUrl
-            parameters { name value }
-          }
-        }
-      }
-  `;
-
-  const stagedData = await graphql(queryStaged, {
+  const stagedData = await graphql(STAGED_QUERY, {
     input: [{
       filename,
       mimeType,
       resource: "FILE",
-      fileSize: fileSize.toString()
+      httpMethod: "POST",
+      fileSize: buffer.byteLength.toString()
     }]
   });
 
-  const target = stagedData.stagedUploadsCreate.stagedTargets[0];
+  const target: StagedTarget = stagedData.stagedUploadsCreate.stagedTargets[0];
 
-  const uploadResponse = await fetch(target.url, {
-    method: 'PUT',
-    headers: {
-      'Content-Type': mimeType,
-      'Content-Length': fileSize.toString()
-    },
-    body: buffer
+  await uploadFormData(target, new Blob([buffer], { type: mimeType }), filename);
+
+  const fileCreateMutation = `
+    mutation fileCreate($files: [FileCreateInput!]!) {
+      fileCreate(files: $files) {
+        files { id fileStatus }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const fileResult = await graphql(fileCreateMutation, {
+    files: [{ originalSource: target.resourceUrl, contentType: "IMAGE" }]
   });
 
-  if (!uploadResponse.ok) throw new Error(`Error al subir imagen a Shopify: ${await uploadResponse.text()}`);
+  if (fileResult.fileCreate.userErrors.length > 0) {
+    throw new Error(`Error en fileCreate: ${JSON.stringify(fileResult.fileCreate.userErrors)}`);
+  }
 
-  return target.resourceUrl;
+  const fileId: string = fileResult.fileCreate.files[0].id;
+  await esperarArchivoListo(fileId);
+
+  return fileId;
 }
 
 // Shopify es especialito y requiere una subida aparte para publicar los productos en los canales de venta
@@ -230,39 +266,19 @@ export async function subirArchivoPublicacionShopify(path: string) {
   const nombreArchivo = path.split('/').pop();
   if (!nombreArchivo) throw new Error("No se pudo obtener el nombre del archivo");
 
-  const queryStaged = `
-        mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-          stagedUploadsCreate(input: $input) {
-            stagedTargets {
-              url
-              resourceUrl
-              parameters { name value }
-            }
-          }
-        }
-  `;
-
-  const stagedData = await graphql(queryStaged, {
+  const stagedData = await graphql(STAGED_QUERY, {
     input: [{
       filename: nombreArchivo,
       mimeType: "text/jsonl",
       resource: "BULK_MUTATION_VARIABLES",
+      httpMethod: "POST",
       fileSize: stat.size.toString()
     }]
   });
 
-  const target = stagedData.stagedUploadsCreate.stagedTargets[0];
+  const target: StagedTarget = stagedData.stagedUploadsCreate.stagedTargets[0];
 
-  const uploadResponse = await fetch(target.url, {
-    method: 'PUT',
-    headers: {
-      'Content-type': 'text/jsonl',
-      'Content-Length': stat.size.toString()
-    },
-    body: stat
-  });
-
-  if (!uploadResponse.ok) throw new Error(`Error al subir el archivo ${await uploadResponse.text()}`);
+  await uploadFormData(target, stat, nombreArchivo);
 
   // Aquí cambiamos la mutación a publishablePublish
   const mutationBulk = `
@@ -278,7 +294,7 @@ export async function subirArchivoPublicacionShopify(path: string) {
     `;
 
   const bulkResult = await graphql(mutationBulk, {
-    stagedUploadPath: target.resourceUrl
+    stagedUploadPath: stagedUploadPath(target)
   });
 
   if (bulkResult.bulkOperationRunMutation.userErrors.length > 0) {

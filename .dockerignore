@@ -1,4 +1,11 @@
 .env
+.env.*
 node_modules
 .git
+.claude
 *.tar
+*.jsonl
+*.csv
+README.md
+dockerfile
+*.tsbuildinfo
